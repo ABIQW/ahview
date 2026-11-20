@@ -1,312 +1,250 @@
 package dev.ahview;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.item.v1.ItemTooltipCallback;
-import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.NbtAccounter;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.CustomData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayInputStream;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Base64;
-import java.util.HashMap;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
- * AhView: Auction House info in SkyBlock item tooltips.
- *  - Sellable on AH: Yes / No
- *  - Lowest BIN and Highest BIN right now
- *  - Last sold price (and how long ago)
+ * Shows Auction House info for ONE item at a time, only while the mouse is over it.
+ * Nothing is downloaded when no item is hovered.
  */
 public class AhViewMod implements ClientModInitializer {
-    private static final Logger LOGGER = LoggerFactory.getLogger("ahview");
+    public static final Logger LOGGER = LoggerFactory.getLogger("ahview");
 
-    private static final String AUCTIONS_URL = "https://api.hypixel.net/v2/skyblock/auctions?page=";
-    private static final String ENDED_URL = "https://api.hypixel.net/v2/skyblock/auctions_ended";
+    private static final String LIST_URL = "https://sky.coflnet.com/api/auctions/tag/%s/active/overview?orderBy=LOWEST_PRICE";
+    private static final String SOLD_URL = "https://sky.coflnet.com/api/auctions/tag/%s/sold?page=0&pageSize=10";
+
+    /** How many of the cheapest sellers are shown. */
+    private static final int SHOW_SELLERS = 3;
+
+    /** While hovering, download this item again every 10 seconds. */
+    private static final long REFRESH_MS = 10_000;
+    /** Items with no auctions at all are re-checked less often. */
+    private static final long EMPTY_MS = 30_000;
+    /** Safety: at most one item lookup (2 requests) per 2 seconds. */
+    private static final long MIN_GAP_MS = 2_000;
+
+    private enum State { LOADING, READY, ERROR }
+
+    private record Offer(String name, double price) {}
+
+    private record Info(State state, boolean sellable, List<Offer> offers,
+                        double lastSold, long lastSoldAt) {}
+
+    private static final class Entry {
+        volatile Info info = new Info(State.LOADING, false, List.of(), 0, -1);
+        volatile long fetchedAt = 0;
+        volatile boolean inFlight = false;
+    }
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    /** Current BIN listings for one item. */
-    private record Listing(double lowest, double highest, int count) {}
+    private static final ExecutorService POOL = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ahview-fetch");
+        t.setDaemon(true);
+        return t;
+    });
 
-    /** Last time this item was seen sold via BIN. */
-    private record Sale(double price, long timeMillis) {}
-
-    private static volatile Map<String, Listing> listings = Map.of();
-    private static volatile boolean listingsLoaded = false;
-    private static final Map<String, Sale> lastSold = new ConcurrentHashMap<>();
-    private static Path saveFile;
-
-    // =====================================================================
-    // Startup + tooltip
-    // =====================================================================
+    private static final ConcurrentHashMap<String, Entry> CACHE = new ConcurrentHashMap<>();
+    private static volatile long lastRequestAt = 0;
 
     @Override
     public void onInitializeClient() {
-        saveFile = FabricLoader.getInstance().getConfigDir().resolve("ahview-lastsold.json");
-        loadSaved();
-
-        ScheduledExecutorService ex = Executors.newScheduledThreadPool(2, r -> {
-            Thread t = new Thread(r, "ahview-refresh");
-            t.setDaemon(true);
-            return t;
-        });
-        // The AH feed itself only updates about once a minute.
-        ex.scheduleWithFixedDelay(AhViewMod::refreshListings, 0, 120, TimeUnit.SECONDS);
-        // auctions_ended only holds roughly the last minute of sales, so poll every 60s.
-        ex.scheduleWithFixedDelay(AhViewMod::refreshSold, 5, 60, TimeUnit.SECONDS);
-
         ItemTooltipCallback.EVENT.register((stack, context, type, lines) -> {
-            String key = itemKey(stack);
-            if (key == null) return; // not a SkyBlock item
+            String key = keyOf(stack);
+            if (key == null) return; // not an auction-style SkyBlock item
 
-            if (!listingsLoaded && lastSold.isEmpty()) {
-                lines.add(Component.literal("AH prices loading...").withStyle(ChatFormatting.GRAY));
-                return;
-            }
+            Info info = get(key);
+            switch (info.state()) {
+                case LOADING -> lines.add(Component.literal("AH loading...").withStyle(ChatFormatting.GRAY));
+                case ERROR -> lines.add(Component.literal("AH unavailable").withStyle(ChatFormatting.GRAY));
+                case READY -> {
+                    if (!info.sellable()) {
+                        lines.add(Component.literal("AH: ").withStyle(ChatFormatting.GRAY)
+                                .append(Component.literal("No").withStyle(ChatFormatting.RED)));
+                    } else {
+                        lines.add(Component.literal("AH: ").withStyle(ChatFormatting.GRAY)
+                                .append(Component.literal("Yes").withStyle(ChatFormatting.GREEN)));
 
-            Listing l = listings.get(key);
-            Sale s = lastSold.get(key);
+                        List<Offer> offers = info.offers();
+                        if (offers.isEmpty()) {
+                            lines.add(Component.literal("Nothing listed right now").withStyle(ChatFormatting.YELLOW));
+                        } else {
+                            lines.add(Component.literal("Lowest: ").withStyle(ChatFormatting.GRAY)
+                                    .append(Component.literal(coins(offers.get(0).price()) + " coins")
+                                            .withStyle(ChatFormatting.GOLD)));
+                            int rank = 1;
+                            for (Offer o : offers) {
+                                lines.add(Component.literal(rank + ". ").withStyle(ChatFormatting.GRAY)
+                                        .append(Component.literal(o.name()).withStyle(ChatFormatting.AQUA))
+                                        .append(Component.literal(" - ").withStyle(ChatFormatting.GRAY))
+                                        .append(Component.literal(coins(o.price()) + " coins")
+                                                .withStyle(ChatFormatting.GOLD)));
+                                rank++;
+                            }
+                        }
 
-            if (l == null && s == null) {
-                lines.add(Component.literal("Sellable on AH: ").withStyle(ChatFormatting.GRAY)
-                        .append(Component.literal("No").withStyle(ChatFormatting.RED))
-                        .append(Component.literal(" (nothing listed or sold)")
-                                .withStyle(ChatFormatting.DARK_GRAY)));
-                return;
-            }
-
-            lines.add(Component.literal("Sellable on AH: ").withStyle(ChatFormatting.GRAY)
-                    .append(Component.literal("Yes").withStyle(ChatFormatting.GREEN)));
-
-            if (l != null) {
-                lines.add(priceLine("Lowest BIN", l.lowest()));
-                lines.add(priceLine("Highest BIN", l.highest()));
-                lines.add(Component.literal("Listed now: " + l.count())
-                        .withStyle(ChatFormatting.DARK_GRAY));
-            } else {
-                lines.add(Component.literal("No BIN listed right now").withStyle(ChatFormatting.YELLOW));
-            }
-
-            if (s != null) {
-                lines.add(Component.literal("Last sold: ").withStyle(ChatFormatting.GRAY)
-                        .append(Component.literal(coins(s.price()) + " coins").withStyle(ChatFormatting.GOLD))
-                        .append(Component.literal(" (" + ago(s.timeMillis()) + ")")
-                                .withStyle(ChatFormatting.DARK_GRAY)));
-            } else {
-                lines.add(Component.literal("Last sold: not seen yet").withStyle(ChatFormatting.DARK_GRAY));
+                        if (info.lastSold() > 0) {
+                            String when = info.lastSoldAt() > 0 ? " (" + ago(info.lastSoldAt()) + ")" : "";
+                            lines.add(Component.literal("Last sold: ").withStyle(ChatFormatting.GRAY)
+                                    .append(Component.literal(coins(info.lastSold()) + " coins" + when)
+                                            .withStyle(ChatFormatting.GOLD)));
+                        }
+                    }
+                }
             }
         });
     }
 
-    // =====================================================================
-    // Item key (so an in-game item matches an auction's item)
-    // =====================================================================
-
-    private static String itemKey(ItemStack stack) {
+    /** SkyBlock item id (reforge/stars ignored), or null for non-SkyBlock items, pets and enchanted books. */
+    private static String keyOf(ItemStack stack) {
         CustomData data = stack.get(DataComponents.CUSTOM_DATA);
         if (data == null) return null;
-        return keyFromTag(data.copyTag());
-    }
-
-    private static String keyFromTag(CompoundTag tag) {
+        CompoundTag tag = data.copyTag();
         String id = tag.getStringOr("id", "");
-        if (id.isEmpty()) return null;
-
-        if (id.equals("ENCHANTED_BOOK")) {
-            CompoundTag ench = tag.getCompoundOrEmpty("enchantments");
-            if (ench.keySet().size() == 1) {
-                String name = ench.keySet().iterator().next();
-                return "ENCHANTMENT_" + name.toUpperCase(Locale.ROOT) + "_" + ench.getIntOr(name, 0);
-            }
-            return id;
-        }
-
-        if (id.equals("PET")) {
-            try {
-                JsonObject info = JsonParser.parseString(tag.getStringOr("petInfo", "{}")).getAsJsonObject();
-                String type = info.get("type").getAsString();
-                String tier = info.get("tier").getAsString();
-                return type + ";" + tier;
-            } catch (Exception ignored) {
-                // fall through
-            }
-        }
+        if (id.isEmpty() || id.equals("PET") || id.equals("ENCHANTED_BOOK")) return null;
         return id;
     }
 
-    /** item_bytes from the auction API = base64( gzipped NBT in the old 1.8 layout ). */
-    private static String keyFromItemBytes(JsonElement el) {
-        try {
-            String b64 = el.isJsonObject() ? el.getAsJsonObject().get("data").getAsString() : el.getAsString();
-            byte[] raw = Base64.getDecoder().decode(b64);
-            CompoundTag root = NbtIo.readCompressed(new ByteArrayInputStream(raw), NbtAccounter.unlimitedHeap());
-            CompoundTag extra = root.getListOrEmpty("i")
-                    .getCompoundOrEmpty(0)
-                    .getCompoundOrEmpty("tag")
-                    .getCompoundOrEmpty("ExtraAttributes");
-            return keyFromTag(extra);
-        } catch (Exception e) {
-            return null;
+    private static Info get(String id) {
+        Entry e = CACHE.computeIfAbsent(id, k -> new Entry());
+        long now = System.currentTimeMillis();
+        Info cur = e.info;
+        long maxAge = (cur.state() == State.READY && !cur.sellable()) ? EMPTY_MS : REFRESH_MS;
+
+        if (!e.inFlight && now - e.fetchedAt >= maxAge && now - lastRequestAt >= MIN_GAP_MS) {
+            e.inFlight = true;
+            lastRequestAt = now;
+            POOL.execute(() -> fetch(id, e));
         }
+        return e.info;
     }
 
-    // =====================================================================
-    // Data: active BINs
-    // =====================================================================
-
-    private static void refreshListings() {
+    private static void fetch(String id, Entry e) {
         try {
-            Map<String, double[]> acc = new HashMap<>(); // id -> {low, high, count}
-            JsonObject first = JsonParser.parseString(fetch(AUCTIONS_URL + 0)).getAsJsonObject();
-            int totalPages = first.get("totalPages").getAsInt();
-            readAuctionPage(first, acc);
+            String enc = URLEncoder.encode(id, StandardCharsets.UTF_8);
+            JsonArray listed = getArray(String.format(LIST_URL, enc));
+            JsonArray sold = getArray(String.format(SOLD_URL, enc));
 
-            for (int page = 1; page < totalPages; page++) {
-                readAuctionPage(JsonParser.parseString(fetch(AUCTIONS_URL + page)).getAsJsonObject(), acc);
-                Thread.sleep(100); // be gentle with the API
-            }
-
-            Map<String, Listing> result = new HashMap<>();
-            for (Map.Entry<String, double[]> e : acc.entrySet()) {
-                double[] v = e.getValue();
-                result.put(e.getKey(), new Listing(v[0], v[1], (int) v[2]));
-            }
-            listings = result;
-            listingsLoaded = true;
-        } catch (Exception ex) {
-            LOGGER.warn("AH refresh failed: {}", ex.toString());
-        }
-    }
-
-    private static void readAuctionPage(JsonObject page, Map<String, double[]> acc) {
-        for (JsonElement el : page.getAsJsonArray("auctions")) {
-            JsonObject a = el.getAsJsonObject();
-            if (!a.has("bin") || !a.get("bin").getAsBoolean()) continue;
-            if (a.has("claimed") && a.get("claimed").getAsBoolean()) continue;
-
-            String id = keyFromItemBytes(a.get("item_bytes"));
-            if (id == null) continue;
-
-            double price = a.get("starting_bid").getAsDouble();
-            double[] cur = acc.get(id);
-            if (cur == null) {
-                acc.put(id, new double[]{price, price, 1});
-            } else {
-                cur[0] = Math.min(cur[0], price);
-                cur[1] = Math.max(cur[1], price);
-                cur[2] += 1;
-            }
-        }
-    }
-
-    // =====================================================================
-    // Data: sold auctions (saved between sessions)
-    // =====================================================================
-
-    private static void refreshSold() {
-        try {
-            JsonObject root = JsonParser.parseString(fetch(ENDED_URL)).getAsJsonObject();
-            boolean changed = false;
-            for (JsonElement el : root.getAsJsonArray("auctions")) {
+            List<Offer> offers = new ArrayList<>();
+            for (JsonElement el : listed) {
+                if (!el.isJsonObject()) continue;
                 JsonObject a = el.getAsJsonObject();
-                if (!a.has("bin") || !a.get("bin").getAsBoolean()) continue;
+                double p = firstPositive(num(a, "price"),
+                        firstPositive(num(a, "startingBid"), num(a, "highestBidAmount")));
+                if (p <= 0) continue;
+                String name = str(a, "playerName");
+                if (name == null || name.isBlank()) name = "Unknown";
+                offers.add(new Offer(name, p));
+            }
+            offers.sort(Comparator.comparingDouble(Offer::price));
+            if (offers.size() > SHOW_SELLERS) {
+                offers = new ArrayList<>(offers.subList(0, SHOW_SELLERS));
+            }
 
-                String id = keyFromItemBytes(a.get("item_bytes"));
-                if (id == null) continue;
-
-                double price = a.get("price").getAsDouble();
-                long time = a.get("timestamp").getAsLong();
-
-                Sale old = lastSold.get(id);
-                if (old == null || time > old.timeMillis()) {
-                    lastSold.put(id, new Sale(price, time));
-                    changed = true;
+            double lastPrice = 0;
+            long lastAt = -1;
+            for (JsonElement el : sold) {
+                if (!el.isJsonObject()) continue;
+                JsonObject a = el.getAsJsonObject();
+                double p = firstPositive(num(a, "highestBidAmount"), num(a, "startingBid"));
+                if (p <= 0) continue;
+                double per = p / Math.max(1, (int) num(a, "count"));
+                long t = parseTime(str(a, "end"));
+                if (lastPrice == 0 || t > lastAt) {
+                    lastPrice = per;
+                    lastAt = t;
                 }
             }
-            if (changed) save();
-        } catch (Exception ex) {
-            LOGGER.warn("Sold refresh failed: {}", ex.toString());
-        }
-    }
 
-    private static void loadSaved() {
-        try {
-            if (Files.exists(saveFile)) {
-                JsonObject root = JsonParser.parseString(Files.readString(saveFile)).getAsJsonObject();
-                for (Map.Entry<String, JsonElement> e : root.entrySet()) {
-                    JsonObject o = e.getValue().getAsJsonObject();
-                    lastSold.put(e.getKey(), new Sale(o.get("p").getAsDouble(), o.get("t").getAsLong()));
-                }
+            boolean sellable = !offers.isEmpty() || lastPrice > 0;
+            e.info = new Info(State.READY, sellable, offers, lastPrice, lastAt);
+        } catch (Exception ex) {
+            if (e.info.state() == State.LOADING) {
+                e.info = new Info(State.ERROR, false, List.of(), 0, -1);
             }
-        } catch (Exception ex) {
-            LOGGER.warn("Could not read saved sales: {}", ex.toString());
+            LOGGER.warn("AH lookup for {} failed: {}", id, ex.toString());
+        } finally {
+            e.fetchedAt = System.currentTimeMillis();
+            e.inFlight = false;
         }
     }
 
-    private static synchronized void save() {
-        try {
-            JsonObject root = new JsonObject();
-            for (Map.Entry<String, Sale> e : lastSold.entrySet()) {
-                JsonObject o = new JsonObject();
-                o.addProperty("p", e.getValue().price());
-                o.addProperty("t", e.getValue().timeMillis());
-                root.add(e.getKey(), o);
-            }
-            Files.writeString(saveFile, root.toString());
-        } catch (Exception ex) {
-            LOGGER.warn("Could not save sales: {}", ex.toString());
-        }
-    }
-
-    // =====================================================================
-    // Helpers
-    // =====================================================================
-
-    private static String fetch(String url) throws Exception {
+    private static JsonArray getArray(String url) throws Exception {
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(20))
+                .timeout(Duration.ofSeconds(10))
                 .header("User-Agent", "AhView-Mod/1.0")
                 .GET()
                 .build();
         HttpResponse<String> res = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-        if (res.statusCode() != 200) {
-            throw new IllegalStateException("HTTP " + res.statusCode() + " from " + url);
+        int code = res.statusCode();
+        if (code == 404) return new JsonArray();
+        if (code != 200) throw new IllegalStateException("HTTP " + code);
+        JsonElement el = JsonParser.parseString(res.body());
+        return el.isJsonArray() ? el.getAsJsonArray() : new JsonArray();
+    }
+
+    private static double num(JsonObject o, String key) {
+        JsonElement v = o.get(key);
+        return (v == null || v.isJsonNull()) ? 0 : v.getAsDouble();
+    }
+
+    private static String str(JsonObject o, String key) {
+        JsonElement v = o.get(key);
+        return (v == null || v.isJsonNull()) ? null : v.getAsString();
+    }
+
+    private static double firstPositive(double a, double b) {
+        return a > 0 ? a : b;
+    }
+
+    private static long parseTime(String s) {
+        if (s == null || s.isEmpty()) return -1;
+        try {
+            return Instant.parse(s).toEpochMilli();
+        } catch (Exception ignored) {
+            // try next format
         }
-        return res.body();
+        try {
+            return LocalDateTime.parse(s).toInstant(ZoneOffset.UTC).toEpochMilli();
+        } catch (Exception ignored) {
+            return -1;
+        }
     }
 
-    private static Component priceLine(String label, double price) {
-        return Component.literal(label + ": ").withStyle(ChatFormatting.GRAY)
-                .append(Component.literal(coins(price) + " coins").withStyle(ChatFormatting.GOLD));
-    }
-
-    private static String ago(long timeMillis) {
-        long s = Math.max(0, (System.currentTimeMillis() - timeMillis) / 1000);
+    private static String ago(long at) {
+        long s = Math.max(0, (System.currentTimeMillis() - at) / 1000);
         if (s < 60) return s + "s ago";
         if (s < 3600) return (s / 60) + "m ago";
         if (s < 86400) return (s / 3600) + "h ago";
